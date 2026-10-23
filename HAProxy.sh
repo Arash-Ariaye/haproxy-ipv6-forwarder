@@ -20,7 +20,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="3.1.0"
+readonly SCRIPT_VERSION="3.1.1"
 readonly MARKER="# Managed by haproxy-forwarder"
 readonly LEGACY_MARKER="# HAProxy IPv4 -> IPv6 Forwarder"
 
@@ -108,9 +108,22 @@ error()   { printf '%s[ERROR]%s %s\n' "$RED" "$NC" "$*" >&2; }
 die()     { error "$*"; exit 1; }
 
 section() {
-    printf '\n%s------------------------------------------%s\n' "$BOLD" "$NC"
-    printf '%s %s%s\n' "$BOLD" "$1" "$NC"
-    printf '%s------------------------------------------%s\n\n' "$BOLD" "$NC"
+    printf '\n%s══════════════════════════════════════════%s\n' "$BOLD" "$NC"
+    printf '%s  %s%s\n' "$BOLD" "$1" "$NC"
+    printf '%s══════════════════════════════════════════%s\n\n' "$BOLD" "$NC"
+}
+
+# Wait for Enter before returning to the menu (interactive only).
+pause_return() {
+    (( ASSUME_YES || HEAL_MODE )) && return 0
+    local _
+    printf '\n  ────────────────────────────────────────\n'
+    read_tty _ "  Press Enter to return to menu... "
+}
+
+# Clear screen when a real terminal is available.
+clear_ui() {
+    [[ -t 1 ]] && printf '\033[H\033[2J' || true
 }
 
 cleanup() {
@@ -1438,19 +1451,28 @@ check_ports_free() {  # check_ports_free both|tcp|udp
 # --------------------------------------------------
 
 list_rules() {
+    local n=1 i
     if (( ${#R_LISTEN[@]} == 0 )); then
         info "No forwarding rules configured."
         return 0
     fi
-    local n=1 i
-    printf '\n  %-4s %-8s %-8s    %-46s %s\n' "#" "Listen" "Proto" "Destination" "Options"
+    printf '  %-4s %-8s %-8s  %-46s %s\n' "#" "Listen" "Proto" "Destination" "Options"
+    printf '  %s\n' "--------------------------------------------------------------------"
     for i in $(sorted_indices); do
-        printf '  %-4s %-8s %-8s -> %-46s %s\n' "$n" ":${R_LISTEN[$i]}" \
+        printf '  %-4s %-8s %-8s  %-46s %s\n' "$n" ":${R_LISTEN[$i]}" \
             "$(proto_label "${R_OPTS[$i]}")" "[${R_IP[$i]}]:${R_DPORT[$i]}" \
             "$(extra_opts "${R_OPTS[$i]}")"
         n=$((n + 1))
     done
     echo
+}
+
+# Clean full-screen view of rules (used from the menu).
+show_rules_view() {
+    clear_ui
+    section "Forwarding Rules"
+    load_rules
+    list_rules
 }
 
 print_port_help() {
@@ -1468,20 +1490,22 @@ EOF
 # Commands
 # --------------------------------------------------
 
-ask_ipv6() {  # sets ANS_IPV6
+ask_ipv6() {  # sets ANS_IPV6; returns 1 on cancel (0)
     local input def=""
     if (( ${#R_IP[@]} )); then
         def="${R_IP[-1]}"
     fi
-    echo "IPv6 address of the foreign server, e.g. 2a01:4f8:c010:3a38::1"
+    echo "  IPv6 of the foreign server, e.g. 2a01:4f8:c010:3a38::1"
+    echo "  0 = back to menu"
     echo
     while true; do
         if [[ -n "$def" ]]; then
-            read_tty input "Destination IPv6 [$def]: "
+            read_tty input "  Destination IPv6 [$def]: "
             input="${input:-$def}"
         else
-            read_tty input "Destination IPv6: "
+            read_tty input "  Destination IPv6: "
         fi
+        [[ "$input" == 0 ]] && return 1
         if ANS_IPV6=$(normalize_ipv6 "$input"); then
             return 0
         fi
@@ -1489,25 +1513,27 @@ ask_ipv6() {  # sets ANS_IPV6
     done
 }
 
-ask_proto() {  # sets ANS_PROTO
+ask_proto() {  # sets ANS_PROTO; returns 1 on cancel (0)
     local c
     if (( ASSUME_YES )); then
         ANS_PROTO=both
         return 0
     fi
     cat <<'EOF'
-  1) TCP + UDP   (recommended: every client and protocol works)
+  1) TCP + UDP   (recommended)
   2) TCP only
   3) UDP only
+  0) Back
 
 EOF
     while true; do
-        read_tty c "Select protocol [1]: "
+        read_tty c "  Select protocol [1]: "
         case "${c:-1}" in
             1) ANS_PROTO=both; return 0 ;;
             2) ANS_PROTO=tcp; return 0 ;;
             3) ANS_PROTO=udp; return 0 ;;
-            *) error "Choose 1, 2 or 3." ;;
+            0) return 1 ;;
+            *) error "Choose 1, 2, 3 or 0." ;;
         esac
     done
 }
@@ -1525,7 +1551,7 @@ cmd_add() {
     if [[ -n "$ARG_IPV6" ]]; then
         ip=$(normalize_ipv6 "$ARG_IPV6") || die "Invalid IPv6 address: $ARG_IPV6"
     else
-        ask_ipv6
+        ask_ipv6 || { warning "Cancelled."; return 0; }
         ip="$ANS_IPV6"
     fi
     info "Destination: [$ip]"
@@ -1543,7 +1569,7 @@ cmd_add() {
     if [[ -n "$ARG_PROTO" ]]; then
         proto="$ARG_PROTO"
     else
-        ask_proto
+        ask_proto || { warning "Cancelled."; return 0; }
         proto="$ANS_PROTO"
     fi
     opts=$(proto_opts "$proto")
@@ -1555,8 +1581,14 @@ cmd_add() {
         check_ports_free "$proto" || exit 1
     else
         print_port_help
+        echo "  0 = back to menu"
+        echo
         while true; do
-            read_tty input "Enter port list: "
+            read_tty input "  Enter port list: "
+            if [[ "$input" == 0 ]]; then
+                warning "Cancelled."
+                return 0
+            fi
             if parse_port_list "$input" && check_ports_free "$proto"; then
                 break
             fi
@@ -1573,7 +1605,11 @@ cmd_add() {
             warning "PROXY protocol lets the foreign server see each user's real IP, but ONLY"
             warning "works if the foreign inbound has PROXY protocol enabled (Xray: acceptProxyProtocol)."
             warning "If it is not enabled there, ALL clients will fail to connect."
-            read_tty input "Type 'proxy' to enable it, or press Enter to skip (recommended): "
+            read_tty input "  Type 'proxy' to enable, Enter to skip, 0 to cancel: "
+            if [[ "$input" == 0 ]]; then
+                warning "Cancelled."
+                return 0
+            fi
             if [[ "${input,,}" == proxy ]]; then
                 opts=$(opt_add "$opts" proxy)
             fi
@@ -1641,7 +1677,13 @@ cmd_remove() {
         input="${ARG_POSITIONAL[*]}"
     else
         list_rules
-        read_tty input "Listening port(s) to remove (comma separated, or 'all'): "
+        echo "  0 = back to menu"
+        echo
+        read_tty input "  Port(s) to remove (comma, or 'all'): "
+        if [[ "$input" == 0 ]]; then
+            warning "Cancelled."
+            return 0
+        fi
     fi
     input="${input//[[:space:]]/,}"
 
@@ -1693,9 +1735,11 @@ cmd_apply() {
 
 cmd_status() {
     load_rules
-    section "Status"
-
+    local interval=1 stop=0 key rc
     local version cc qdisc pid nofile="-" i p o mark tcp_n udp_n
+    local -A bytes=()
+    local name val down up repairs
+
     if command -v haproxy >/dev/null 2>&1; then
         version=$(haproxy -v 2>/dev/null | sed -n 1p)
     else
@@ -1707,68 +1751,92 @@ cmd_status() {
     if [[ "${pid:-0}" != 0 && -r "/proc/$pid/limits" ]]; then
         nofile=$(awk '/^Max open files/ {print $4}' "/proc/$pid/limits")
     fi
-
-    printf '  %-20s %s\n' "HAProxy (TCP):" "$version"
-    printf '  %-20s %s\n' "TCP service:" "$(service_state haproxy)"
-    printf '  %-20s %s\n' "UDP service:" "$(service_state "$UDP_SERVICE")"
-    printf '  %-20s %s / %s\n' "Congestion control:" "$cc" "$qdisc"
-    printf '  %-20s %s\n' "Open files limit:" "$nofile"
-    if [[ -f "$SYSCTL_FILE" ]]; then
-        printf '  %-20s %s\n' "Network tuning:" "applied"
-    else
-        printf '  %-20s %s\n' "Network tuning:" "not applied (run: optimize)"
-    fi
-    if svc is-active --quiet "$HEAL_UNIT.timer"; then
-        printf '  %-20s %s\n' "Auto-repair:" "on (after boot and every minute)"
-    else
-        printf '  %-20s %s\n' "Auto-repair:" "off (run: apply)"
-    fi
-    local repairs
-    repairs=$(journalctl -u "$HEAL_UNIT" --no-pager -o short-iso -n 300 2>/dev/null \
-        | grep -E 'Repair|ERROR' | tail -n 3 || true)
-    if [[ -n "$repairs" ]]; then
-        printf '  %-20s\n' "Recent repairs:"
-        printf '%s\n' "$repairs" | sed 's/^/    /'
+    if ! counters_present && (( ${#R_LISTEN[@]} > 0 )); then
+        update_counters 2>/dev/null || true
     fi
 
-    if (( ${#R_LISTEN[@]} == 0 )); then
-        echo
-        info "No forwarding rules configured."
-        return 0
-    fi
-
-    local -A bytes=()
-    local name val down up
-    if counters_present; then
-        while read -r name val; do
-            bytes[$name]="$val"
-        done < <(read_counters)
-    fi
-
-    printf '\n  %-8s %-8s    %-42s %-6s %-6s %-6s %-11s %s\n' \
-        "Listen" "Proto" "Destination" "State" "TCP" "UDP" "To users" "From users"
-    for i in $(sorted_indices); do
-        p="${R_LISTEN[$i]}"
-        o="${R_OPTS[$i]}"
-        mark="${GREEN}ok${NC}    "
-        if { rule_has_tcp "$o" && ! port_is_listening tcp "$p"; } \
-            || { rule_has_udp "$o" && ! port_is_listening udp "$p"; }; then
-            mark="${RED}down${NC}  "
+    trap 'stop=1' INT
+    printf '\033[?25l'
+    while (( ! stop )); do
+        load_rules
+        bytes=()
+        if counters_present; then
+            while read -r name val; do
+                bytes[$name]="$val"
+            done < <(read_counters)
         fi
-        tcp_n="-"
-        udp_n="-"
-        if rule_has_tcp "$o"; then tcp_n=$(tcp_conn_count "$p"); fi
-        if rule_has_udp "$o"; then udp_n=$(udp_session_count "${R_IP[$i]}" "${R_DPORT[$i]}"); fi
-        down=$(( ${bytes[t${p}o]:-0} + ${bytes[u${p}o]:-0} ))
-        up=$(( ${bytes[t${p}i]:-0} + ${bytes[u${p}i]:-0} ))
-        printf '  %-8s %-8s -> %-42s %s %-6s %-6s %-11s %s\n' ":$p" "$(proto_label "$o")" \
-            "[${R_IP[$i]}]:${R_DPORT[$i]}" "$mark" "$tcp_n" "$udp_n" \
-            "$(fmt_bytes "$down")" "$(fmt_bytes "$up")"
+
+        clear_ui
+        printf '%s══════════════════════════════════════════%s\n' "$BOLD" "$NC"
+        printf '%s  Status  ·  live (every %ss)%s\n' "$BOLD" "$interval" "$NC"
+        printf '%s══════════════════════════════════════════%s\n\n' "$BOLD" "$NC"
+
+        printf '  %-18s %s\n' "HAProxy (TCP):" "$version"
+        printf '  %-18s %s\n' "TCP service:" "$(state_label haproxy)"
+        printf '  %-18s %s\n' "UDP service:" "$(state_label "$UDP_SERVICE")"
+        printf '  %-18s %s / %s\n' "Congestion:" "$cc" "$qdisc"
+        printf '  %-18s %s\n' "Open files limit:" "$nofile"
+        if [[ -f "$SYSCTL_FILE" ]]; then
+            printf '  %-18s %s\n' "Network tuning:" "${GREEN}applied${NC}"
+        else
+            printf '  %-18s %s\n' "Network tuning:" "not applied (menu → 6)"
+        fi
+        if svc is-active --quiet "$HEAL_UNIT.timer"; then
+            printf '  %-18s %s\n' "Auto-repair:" "${GREEN}on${NC} (boot + every minute)"
+        else
+            printf '  %-18s %s\n' "Auto-repair:" "${RED}off${NC} (run apply)"
+        fi
+
+        repairs=$(journalctl -u "$HEAL_UNIT" --no-pager -o short-iso -n 300 2>/dev/null \
+            | grep -E 'Repair|ERROR' | tail -n 2 || true)
+        if [[ -n "$repairs" ]]; then
+            printf '  %-18s\n' "Recent repairs:"
+            printf '%s\n' "$repairs" | sed 's/^/    /'
+        fi
+
+        if (( ${#R_LISTEN[@]} == 0 )); then
+            echo
+            info "No forwarding rules configured."
+        else
+            printf '\n  %-8s %-8s  %-40s %-6s %-5s %-5s %-10s %s\n' \
+                "Listen" "Proto" "Destination" "State" "TCP" "UDP" "To users" "From users"
+            printf '  %s\n' "------------------------------------------------------------------------"
+            for i in $(sorted_indices); do
+                p="${R_LISTEN[$i]}"
+                o="${R_OPTS[$i]}"
+                mark="${GREEN}ok${NC}  "
+                if { rule_has_tcp "$o" && ! port_is_listening tcp "$p"; } \
+                    || { rule_has_udp "$o" && ! port_is_listening udp "$p"; }; then
+                    mark="${RED}down${NC}"
+                fi
+                tcp_n="-"
+                udp_n="-"
+                if rule_has_tcp "$o"; then tcp_n=$(tcp_conn_count "$p"); fi
+                if rule_has_udp "$o"; then udp_n=$(udp_session_count "${R_IP[$i]}" "${R_DPORT[$i]}"); fi
+                down=$(( ${bytes[t${p}o]:-0} + ${bytes[u${p}o]:-0} ))
+                up=$(( ${bytes[t${p}i]:-0} + ${bytes[u${p}i]:-0} ))
+                printf '  %-8s %-8s  %-40s %s %-5s %-5s %-10s %s\n' \
+                    ":$p" "$(proto_label "$o")" "[${R_IP[$i]}]:${R_DPORT[$i]}" \
+                    "$mark" "$tcp_n" "$udp_n" "$(fmt_bytes "$down")" "$(fmt_bytes "$up")"
+            done
+            echo
+            echo "  Traffic totals since boot / last rule change. Live rates: menu → 5"
+        fi
+
+        printf '\n  %s0%s / %sq%s  back to menu   ·  Ctrl+C also works\n' \
+            "$BOLD" "$NC" "$BOLD" "$NC"
+        printf '  Updated: %s\n' "$(date '+%H:%M:%S')"
+
+        rc=0
+        read -rsn1 -t "$interval" key </dev/tty 2>/dev/null || rc=$?
+        if (( rc == 0 )); then
+            case "${key,,}" in
+                0|q) break ;;
+            esac
+        fi
     done
-    echo
-    echo "  TCP/UDP: open user connections / UDP sessions. Traffic totals count since boot"
-    echo "  or the last rule change. Live speeds: monitor"
-    echo
+    printf '\033[?25h'
+    trap - INT
 }
 
 # Network interface carrying the default route, for the server-wide rates.
@@ -1819,7 +1887,7 @@ cmd_monitor() {
         read -rsn1 -t "$interval" key </dev/tty 2>/dev/null || rc=$?
         if (( rc == 1 )); then
             sleep "$interval"        # no terminal: just keep refreshing
-        elif (( rc == 0 )) && [[ "${key,,}" == q ]]; then
+        elif (( rc == 0 )) && [[ "${key,,}" == q || "$key" == 0 ]]; then
             break
         fi
         (( stop )) && break
@@ -1831,7 +1899,7 @@ cmd_monitor() {
         if [[ -n "$iface" ]]; then read -r rx tx < <(iface_bytes "$iface"); fi
 
         printf '\033[H\033[2J'
-        printf '%s IPv4 -> IPv6 Forwarder - live traffic%s   %s   (every %ss, q or Ctrl+C to exit)\n\n' \
+        printf '%s IPv4 -> IPv6 Forwarder - live traffic%s   %s   (every %ss · 0/q or Ctrl+C to go back)\n\n' \
             "$BOLD" "$NC" "$(date '+%H:%M:%S')" "$interval"
         printf '  TCP: %s   UDP: %s   Load: %s\n' "$(state_label haproxy)" \
             "$(state_label "$UDP_SERVICE")" "$(cut -d' ' -f1-3 /proc/loadavg)"
@@ -2054,33 +2122,38 @@ menu() {
     local choice
     while true; do
         load_rules
-        section "IPv4 -> IPv6 Forwarder v$SCRIPT_VERSION"
-        printf '  TCP: %s    UDP: %s    Rules: %s\n\n' \
-            "$(state_label haproxy)" "$(state_label "$UDP_SERVICE")" "${#R_LISTEN[@]}"
+        clear_ui
+        printf '%s══════════════════════════════════════════%s\n' "$BOLD" "$NC"
+        printf '%s  IPv4 → IPv6 Forwarder  v%s%s\n' "$BOLD" "$SCRIPT_VERSION" "$NC"
+        printf '%s══════════════════════════════════════════%s\n\n' "$BOLD" "$NC"
+        printf '  TCP: %s    UDP: %s    Rules: %s%s%s\n\n' \
+            "$(state_label haproxy)" "$(state_label "$UDP_SERVICE")" \
+            "$BOLD" "${#R_LISTEN[@]}" "$NC"
         cat <<'EOF'
-  1) Add / update forwarding rules
-  2) List rules
-  3) Remove rules
-  4) Status (services, connections, traffic totals)
-  5) Live traffic monitor
-  6) Network performance tuning (BBR, buffers, limits)
-  7) Rebuild configs and reload
-  8) Uninstall
-  0) Exit
+  1)  Add / update rules
+  2)  List rules
+  3)  Remove rules
+  4)  Status          (live)
+  5)  Live traffic    (rates)
+  6)  Network tuning  (BBR, buffers)
+  7)  Rebuild & reload
+  8)  Uninstall
 
+  0)  Exit
 EOF
-        read_tty choice "Select an option: "
+        echo
+        read_tty choice "  Select: "
         case "$choice" in
-            1) run_action cmd_add ;;
-            2) list_rules ;;
-            3) run_action cmd_remove ;;
+            1) clear_ui; run_action cmd_add; pause_return ;;
+            2) show_rules_view; pause_return ;;
+            3) clear_ui; run_action cmd_remove; pause_return ;;
             4) run_action cmd_status ;;
             5) run_action cmd_monitor ;;
-            6) run_action cmd_optimize ;;
-            7) run_action cmd_apply ;;
-            8) run_action cmd_uninstall ;;
-            0|q|Q) exit 0 ;;
-            *) error "Invalid option: $choice" ;;
+            6) clear_ui; run_action cmd_optimize; pause_return ;;
+            7) clear_ui; run_action cmd_apply; pause_return ;;
+            8) clear_ui; run_action cmd_uninstall; pause_return ;;
+            0|q|Q) clear_ui; exit 0 ;;
+            *) error "Invalid option: $choice"; sleep 1 ;;
         esac
     done
 }
